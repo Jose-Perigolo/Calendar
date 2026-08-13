@@ -13,12 +13,14 @@ Validated against plugin `defaults` at registration (Seneca/gubu).
 | `tick.active` | `false` | When true, periodically run `notify:due`. |
 | `tick.interval` | `60000` | Tick period in ms. Cleared on `seneca.close`. |
 | `notifyCallback` | no-op function | Optional `(data) => any` delivery function (`this` = seneca). |
+| `record` | `false` | Persist notification outbox rows on each emission attempt. |
+| `recordCanon` | `{ base: 'sys', name: 'calendar_notification' }` | Entity canon for outbox rows. |
 
 ## Entity: `sys/calendar` (default)
 
 | Field | Type | Notes |
 | ----- | ---- | ----- |
-| `key` | string | Stable id (`id` = key). Unique; `add:event` rejects duplicates. |
+| `key` | string | Stable id (`id` = key). Must match `^[A-Za-z0-9._:-]+$`. Unique. |
 | `kind` | string | e.g. `tls`, `secret`, `token`. |
 | `title` | string | Short label. |
 | `description` | string | Longer text. |
@@ -29,11 +31,27 @@ Validated against plugin `defaults` at registration (Seneca/gubu).
 | `severity` | string | `info` \| `warn` \| `critical`. |
 | `status` | string | `active` \| `acknowledged` \| `snoozed` \| `done`. |
 | `snoozeUntil` | number \| null | Wake time when snoozed. |
-| `lastNotified` | number \| null | Last `notify:due` emission time. |
-| `notifiedStages` | number[] | Reminder stages already emitted this cycle (includes `0` for due). |
+| `lastNotified` | number \| null | Last successful `notify:due` emission time. |
+| `notifiedStages` | number[] | Reminder stages successfully delivered this cycle (includes `0` for due). |
 | `assignee` | string \| null | Optional owner. |
 | `tags` | string[] | Labels. |
 | `meta` | object | Free-form metadata. |
+
+## Entity: `sys/calendar_notification` (outbox, when `record:true`)
+
+| Field | Type | Notes |
+| ----- | ---- | ----- |
+| `event_key` | string | Calendar event key. |
+| `stage` | number | Remind stage (ms offset, or `0` for due). |
+| `when` | number | Attempt timestamp. |
+| `severity` | string | Copied from event. |
+| `delivered` | boolean | `true` only when hook/callback succeeded. |
+| `result` | object \| null | Hook/callback return value (best-effort). |
+| `meta` | object | Extra (e.g. `digest`, error message). |
+
+## Concurrency
+
+`notify:due` has no lock. Use a **single scheduler / single notifier instance** to avoid double-delivery under concurrent polls. See [how-to](how-to.md#single-scheduler-note).
 
 ## Action patterns
 
@@ -41,7 +59,7 @@ All under `sys:calendar`.
 
 ### `add:event`
 
-Create an event. Fails with `why: 'key-exists'` if the key exists, unless `existing:true` (returns the existing row, does not overwrite).
+Create an event. Fails with `why: 'invalid-key'` if the key is not Cosmos-safe, or `why: 'key-exists'` if the key exists (unless `existing:true`).
 
 Parameters: `key`, `due` (required); `kind`, `title`, `description`, `remindBefore`, `recurrence`, `severity`, `assignee`, `tags`, `meta`, `intervalMs`, `existing`.
 
@@ -61,7 +79,7 @@ Returns: `{ ok, list }`.
 
 ### `update:event`
 
-Parameters: `key` plus any updatable fields.
+Parameters: `key` plus any updatable fields. Validates `severity` / `status` / `recurrence` **before** mutating the entity.
 
 Returns: `{ ok, event?, why? }`.
 
@@ -81,7 +99,7 @@ Returns: `{ ok, now, list }`.
 
 ### `ack:event`
 
-Acknowledge. Recurring (`recurrence !== 'none'`): advance `due` with calendar-correct month/year (or fixed interval), keep `active`, clear `notifiedStages`. Non-recurring: set `status` to `done` (unless `done:false` → `acknowledged`).
+Acknowledge. Recurring (`recurrence !== 'none'`): advance `due`, keep `active`, clear `notifiedStages`. Non-recurring: default `status: 'acknowledged'`; pass `done:true` for `done`.
 
 Parameters: `key`; optional `now`, `done`.
 
@@ -97,22 +115,53 @@ Returns: `{ ok, now, event?, why? }`.
 
 ### `notify:due`
 
-For each due event, compute crossed reminder stages; emit only stages not in `notifiedStages`. Delivery via `notifyCallback` and/or `sys:calendar,hook:notify`. Persist updated `notifiedStages` / `lastNotified`.
+For each due event, compute crossed reminder stages; emit only stages not in `notifiedStages`. Delivery via `notifyCallback` and/or `sys:calendar,hook:notify`.
 
-Parameters: optional `now`.
+**Success gating:** stages are appended to `notifiedStages` only when delivery succeeds (no throw, and result is not `{ok:false}`). Failures are collected in `failed` and other events continue.
 
-Returns: `{ ok, now, notified }` where each item is `{ key, stages, event }`.
+Parameters: optional `now`, `digest` (boolean).
+
+Returns: `{ ok, now, notified, failed, digest? }`.
+
+With `digest:true`, one payload `{ digest:true, events:[...], now }` is delivered; per-event stage accounting still applies.
+
+### `export:ics`
+
+Build a `VCALENDAR` string for events matching optional `q`.
+
+Returns: `{ ok, ics, count }`.
+
+### `list:notifications`
+
+List outbox rows (useful when `record:true`).
+
+Parameters: `q` (default `{}`).
+
+Returns: `{ ok, list }`.
+
+### `refresh:event` / `refresh:events`
+
+Call app-registered `sys:calendar,hook:source` to recompute `due`. No hook → no-op.
+
+Parameters: `key` (single) or `q` (batch); optional `now`.
+
+Returns: `{ ok, changed?, event?, why? }` or `{ ok, now, list }`.
 
 ### `hook:notify` (optional, app-registered)
 
-Not registered by the plugin (so it is not re-pinned over your handler at init).
-Add it yourself to receive deliveries from `notify:due`:
-
 ```js
 seneca.message('sys:calendar,hook:notify', async function (msg) {
-  // msg.event, msg.stages, msg.now
+  // per-event: msg.event, msg.stages, msg.now
+  // digest: msg.digest, msg.events, msg.now
   return { ok: true }
 })
 ```
 
-Parameters: `event`, `stages`, `now`.
+### `hook:source` (optional, app-registered)
+
+```js
+seneca.message('sys:calendar,hook:source', async function (msg) {
+  // msg.key, msg.kind, msg.event, msg.now
+  return { ok: true, due: newDueMs }
+})
+```

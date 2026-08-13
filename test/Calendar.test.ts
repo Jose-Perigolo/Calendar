@@ -5,8 +5,9 @@ import Seneca from 'seneca'
 import CalendarDoc from '../src/CalendarDoc'
 import Calendar from '../src/Calendar'
 
-const nextDue = (Calendar as any).nextDue as typeof import('../src/Calendar').nextDue
-const crossedStages = (Calendar as any).crossedStages as typeof import('../src/Calendar').crossedStages
+const nextDue = (Calendar as any).nextDue
+const crossedStages = (Calendar as any).crossedStages
+const buildIcs = (Calendar as any).buildIcs
 
 const MS_DAY = 24 * 60 * 60 * 1000
 const MS_HOUR = 60 * 60 * 1000
@@ -106,6 +107,38 @@ describe('Calendar', () => {
   })
 
 
+  test('invalid-key-rejected-valid-roundtrips', async () => {
+    const seneca = makeSeneca()
+    const due = Date.UTC(2026, 0, 1)
+
+    const bad = await seneca.post('sys:calendar,add:event', {
+      key: 'tls/api#1',
+      due,
+    })
+    expect(bad).toMatchObject({ ok: false, why: 'invalid-key' })
+
+    const badQ = await seneca.post('sys:calendar,add:event', {
+      key: 'has?query',
+      due,
+    })
+    expect(badQ).toMatchObject({ ok: false, why: 'invalid-key' })
+
+    const good = await seneca.post('sys:calendar,add:event', {
+      key: 'tls.api_v1:prod-2',
+      due,
+    })
+    expect(good).toMatchObject({
+      ok: true,
+      event: { key: 'tls.api_v1:prod-2', id: 'tls.api_v1:prod-2' },
+    })
+
+    const got = await seneca.post('sys:calendar,get:event', {
+      key: 'tls.api_v1:prod-2',
+    })
+    expect(got).toMatchObject({ ok: true, event: { key: 'tls.api_v1:prod-2' } })
+  })
+
+
   test('due-events-with-injected-now', async () => {
     const due = Date.UTC(2026, 0, 15)
     let now = due - 10 * MS_DAY
@@ -117,17 +150,14 @@ describe('Calendar', () => {
       remindBefore: [7 * MS_DAY, MS_DAY],
     })
 
-    // Outside window
     let dueRes = await seneca.post('sys:calendar,due:events')
     expect(dueRes).toMatchObject({ ok: true, list: [] })
 
-    // Enter 7d window
     now = due - 7 * MS_DAY
     dueRes = await seneca.post('sys:calendar,due:events')
     expect(dueRes.list).toHaveLength(1)
     expect(dueRes.list[0].key).toBe('secret-a')
 
-    // Explicit now on message overrides option clock
     dueRes = await seneca.post('sys:calendar,due:events', {
       now: due - 10 * MS_DAY,
     })
@@ -153,32 +183,95 @@ describe('Calendar', () => {
       remindBefore: [30 * MS_DAY, 7 * MS_DAY, MS_DAY],
     })
 
-    // At 30d threshold — one emission
     now = due - 30 * MS_DAY
     let res = await seneca.post('sys:calendar,notify:due')
     expect(res.notified).toHaveLength(1)
     expect(res.notified[0].stages).toEqual([30 * MS_DAY])
     expect(notified).toHaveLength(1)
 
-    // Poll again inside same stage — no re-emit
     res = await seneca.post('sys:calendar,notify:due')
     expect(res.notified).toHaveLength(0)
     expect(notified).toHaveLength(1)
 
-    // Cross 7d — only the new stage
     now = due - 7 * MS_DAY
     res = await seneca.post('sys:calendar,notify:due')
     expect(res.notified).toHaveLength(1)
     expect(res.notified[0].stages).toEqual([7 * MS_DAY])
     expect(notified).toHaveLength(2)
 
-    // Cross due (stage 0) and 1d together if we jump past both
     now = due
     res = await seneca.post('sys:calendar,notify:due')
     expect(res.notified[0].stages.sort((a: number, b: number) => b - a)).toEqual([
       MS_DAY,
       0,
     ])
+  })
+
+
+  test('notify-delivery-failure-does-not-mark-stages', async () => {
+    const due = Date.UTC(2026, 3, 1)
+    const now = due
+    let failA = true
+
+    const seneca = makeSeneca({ now: () => now, record: true })
+
+    seneca.message('sys:calendar,hook:notify', async function (msg: any) {
+      if (msg.event && msg.event.key === 'ev-a' && failA) {
+        throw new Error('boom')
+      }
+      if (msg.event && msg.event.key === 'ev-b') {
+        return { ok: false, why: 'channel-down' }
+      }
+      return { ok: true }
+    })
+
+    await seneca.post('sys:calendar,add:event', {
+      key: 'ev-a',
+      due,
+      remindBefore: [],
+    })
+    await seneca.post('sys:calendar,add:event', {
+      key: 'ev-b',
+      due,
+      remindBefore: [],
+    })
+    await seneca.post('sys:calendar,add:event', {
+      key: 'ev-c',
+      due,
+      remindBefore: [],
+    })
+
+    const res = await seneca.post('sys:calendar,notify:due')
+    expect(res.notified.map((n: any) => n.key).sort()).toEqual(['ev-c'])
+    expect(res.failed.map((f: any) => f.key).sort()).toEqual(['ev-a', 'ev-b'])
+
+    const a = await seneca.post('sys:calendar,get:event,key:ev-a')
+    const b = await seneca.post('sys:calendar,get:event,key:ev-b')
+    const c = await seneca.post('sys:calendar,get:event,key:ev-c')
+    expect(a.event.notifiedStages).toEqual([])
+    expect(b.event.notifiedStages).toEqual([])
+    expect(c.event.notifiedStages).toEqual([0])
+
+    const notes = await seneca.post('sys:calendar,list:notifications')
+    expect(notes.list.length).toBe(3)
+    const byKey: any = {}
+    for (const n of notes.list) byKey[n.event_key] = n
+    expect(byKey['ev-a'].delivered).toBe(false)
+    expect(byKey['ev-b'].delivered).toBe(false)
+    expect(byKey['ev-c'].delivered).toBe(true)
+
+    // Retry after fixing A — stage should fire once and stick
+    failA = false
+    const retry = await seneca.post('sys:calendar,notify:due')
+    expect(retry.notified.map((n: any) => n.key).sort()).toEqual(['ev-a'])
+    // ev-b still returns ok:false
+    expect(retry.failed.map((f: any) => f.key)).toContain('ev-b')
+
+    const a2 = await seneca.post('sys:calendar,get:event,key:ev-a')
+    expect(a2.event.notifiedStages).toEqual([0])
+
+    const retry2 = await seneca.post('sys:calendar,notify:due')
+    expect(retry2.notified.find((n: any) => n.key === 'ev-a')).toBeUndefined()
   })
 
 
@@ -208,7 +301,7 @@ describe('Calendar', () => {
   })
 
 
-  test('ack-recurrence-rollover-and-stage-reset', async () => {
+  test('ack-defaults-to-acknowledged-done-requires-flag', async () => {
     const due = Date.UTC(2026, 0, 10)
     let now = due
     const seneca = makeSeneca({ now: () => now })
@@ -220,11 +313,7 @@ describe('Calendar', () => {
       remindBefore: [MS_DAY],
     })
 
-    // Fire notify so stages are recorded
     await seneca.post('sys:calendar,notify:due')
-    let get0 = await seneca.post('sys:calendar,get:event,key:weekly-check')
-    expect(get0.event.notifiedStages.length).toBeGreaterThan(0)
-
     const ack0 = await seneca.post('sys:calendar,ack:event,key:weekly-check')
     expect(ack0).toMatchObject({
       ok: true,
@@ -236,7 +325,6 @@ describe('Calendar', () => {
       },
     })
 
-    // Non-recurring → done
     await seneca.post('sys:calendar,add:event', {
       key: 'once',
       due,
@@ -245,32 +333,66 @@ describe('Calendar', () => {
     const ack1 = await seneca.post('sys:calendar,ack:event,key:once')
     expect(ack1).toMatchObject({
       ok: true,
-      event: { status: 'done', notifiedStages: [] },
+      event: { status: 'acknowledged', notifiedStages: [] },
     })
 
-    // Done events are not due
+    // acknowledged (non-active) is not due
     now = due + 1000
-    const dueRes = await seneca.post('sys:calendar,due:events')
+    let dueRes = await seneca.post('sys:calendar,due:events')
     expect(dueRes.list.find((e: any) => e.key === 'once')).toBeUndefined()
+
+    await seneca.post('sys:calendar,add:event', {
+      key: 'once-done',
+      due,
+      recurrence: 'none',
+    })
+    const ack2 = await seneca.post('sys:calendar,ack:event', {
+      key: 'once-done',
+      done: true,
+    })
+    expect(ack2).toMatchObject({
+      ok: true,
+      event: { status: 'done' },
+    })
+  })
+
+
+  test('update-validates-before-assign', async () => {
+    const due = Date.UTC(2026, 0, 1)
+    const seneca = makeSeneca()
+    await seneca.post('sys:calendar,add:event', {
+      key: 'upd-me',
+      due,
+      severity: 'info',
+      title: 'keep',
+    })
+
+    const bad = await seneca.post('sys:calendar,update:event', {
+      key: 'upd-me',
+      title: 'mutated',
+      severity: 'nope',
+    })
+    expect(bad).toMatchObject({ ok: false, why: 'invalid-severity' })
+
+    const got = await seneca.post('sys:calendar,get:event,key:upd-me')
+    expect(got.event.title).toBe('keep')
+    expect(got.event.severity).toBe('info')
   })
 
 
   test('monthly-yearly-calendar-arithmetic', () => {
-    // Jan 31 + 1 month → last day of Feb
     const jan31 = Date.UTC(2026, 0, 31, 12, 0, 0)
     const feb = new Date(nextDue(jan31, 'monthly'))
     expect(feb.getUTCFullYear()).toBe(2026)
     expect(feb.getUTCMonth()).toBe(1)
     expect(feb.getUTCDate()).toBe(28)
 
-    // Feb 28 + 1 year → Feb 28
     const feb28 = Date.UTC(2025, 1, 28, 12, 0, 0)
     const nextYear = new Date(nextDue(feb28, 'yearly'))
     expect(nextYear.getUTCFullYear()).toBe(2026)
     expect(nextYear.getUTCMonth()).toBe(1)
     expect(nextYear.getUTCDate()).toBe(28)
 
-    // interval-ms is fixed
     expect(nextDue(1000, 'interval-ms', 500)).toBe(1500)
     expect(nextDue(1000, 'daily')).toBe(1000 + MS_DAY)
   })
@@ -327,12 +449,10 @@ describe('Calendar', () => {
     let dueRes = await seneca.post('sys:calendar,due:events')
     expect(dueRes.list).toHaveLength(0)
 
-    // Still snoozed before until
     now = due + MS_DAY
     dueRes = await seneca.post('sys:calendar,due:events')
     expect(dueRes.list).toHaveLength(0)
 
-    // After snoozeUntil, due again and notify can fire stages fresh
     now = until + 1
     dueRes = await seneca.post('sys:calendar,due:events')
     expect(dueRes.list).toHaveLength(1)
@@ -346,6 +466,138 @@ describe('Calendar', () => {
     const nres = await seneca.post('sys:calendar,notify:due')
     expect(nres.notified.length).toBe(1)
     expect(notified.length).toBe(1)
+  })
+
+
+  test('export-ics', async () => {
+    const due = Date.UTC(2026, 6, 15, 12, 0, 0)
+    const seneca = makeSeneca()
+
+    await seneca.post('sys:calendar,add:event', {
+      key: 'ics-yearly',
+      title: 'Yearly cert',
+      description: 'Line1\nLine2',
+      due,
+      kind: 'tls',
+      severity: 'warn',
+      recurrence: 'yearly',
+    })
+    await seneca.post('sys:calendar,add:event', {
+      key: 'ics-once',
+      title: 'One shot',
+      due: due + MS_DAY,
+      recurrence: 'none',
+    })
+
+    const res = await seneca.post('sys:calendar,export:ics')
+    expect(res.ok).toBe(true)
+    expect(res.count).toBe(2)
+    expect(res.ics).toContain('BEGIN:VCALENDAR')
+    expect(res.ics).toContain('BEGIN:VEVENT')
+    expect(res.ics).toContain('UID:ics-yearly')
+    expect(res.ics).toContain('SUMMARY:Yearly cert')
+    expect(res.ics).toContain('RRULE:FREQ=YEARLY')
+    expect(res.ics).toContain('CATEGORIES:warn,tls')
+    expect(res.ics).not.toMatch(/UID:ics-once[\s\S]*RRULE/)
+
+    // Helper round-trip of key fields
+    const built = buildIcs([
+      {
+        key: 'x',
+        title: 'T',
+        due,
+        severity: 'info',
+        kind: 'secret',
+        recurrence: 'weekly',
+      },
+    ])
+    expect(built).toContain('UID:x')
+    expect(built).toContain('RRULE:FREQ=WEEKLY')
+    expect(built).toContain('DTSTART:20260715T120000Z')
+  })
+
+
+  test('notify-digest', async () => {
+    const due = Date.UTC(2026, 7, 1)
+    const now = due
+    const payloads: any[] = []
+
+    const seneca = makeSeneca({
+      now: () => now,
+      notifyCallback: function (data: any) {
+        payloads.push(data)
+      },
+    })
+
+    await seneca.post('sys:calendar,add:event', {
+      key: 'd1',
+      due,
+      remindBefore: [],
+    })
+    await seneca.post('sys:calendar,add:event', {
+      key: 'd2',
+      due,
+      remindBefore: [],
+    })
+
+    const res = await seneca.post('sys:calendar,notify:due', { digest: true })
+    expect(res.digest).toBe(true)
+    expect(payloads).toHaveLength(1)
+    expect(payloads[0].digest).toBe(true)
+    expect(payloads[0].events).toHaveLength(2)
+    expect(res.notified.map((n: any) => n.key).sort()).toEqual(['d1', 'd2'])
+
+    const d1 = await seneca.post('sys:calendar,get:event,key:d1')
+    const d2 = await seneca.post('sys:calendar,get:event,key:d2')
+    expect(d1.event.notifiedStages).toEqual([0])
+    expect(d2.event.notifiedStages).toEqual([0])
+
+    const again = await seneca.post('sys:calendar,notify:due', { digest: true })
+    expect(again.notified).toHaveLength(0)
+    expect(payloads).toHaveLength(1)
+  })
+
+
+  test('refresh-event-source-hook', async () => {
+    const due = Date.UTC(2026, 8, 1)
+    const now = due
+    const seneca = makeSeneca({ now: () => now })
+
+    await seneca.post('sys:calendar,add:event', {
+      key: 'live-tls',
+      kind: 'tls',
+      due,
+    })
+
+    // No hook → no-op
+    const noop = await seneca.post('sys:calendar,refresh:event,key:live-tls')
+    expect(noop).toMatchObject({
+      ok: true,
+      changed: false,
+      why: 'no-source-hook',
+      event: { due },
+    })
+
+    const next = due + 30 * MS_DAY
+    seneca.message('sys:calendar,hook:source', async function (msg: any) {
+      if (msg.key === 'live-tls') {
+        return { ok: true, due: next }
+      }
+      return { ok: true }
+    })
+
+    const refreshed = await seneca.post(
+      'sys:calendar,refresh:event,key:live-tls',
+    )
+    expect(refreshed).toMatchObject({
+      ok: true,
+      changed: true,
+      event: { due: next, notifiedStages: [] },
+    })
+
+    const batch = await seneca.post('sys:calendar,refresh:events')
+    expect(batch.ok).toBe(true)
+    expect(batch.list[0].changed).toBe(false) // same due returned
   })
 
 
@@ -367,7 +619,6 @@ describe('Calendar', () => {
     await new Promise<void>((resolve, reject) => {
       seneca.close((err: any) => (err ? reject(err) : resolve()))
     })
-    // If the interval leaked, Jest would hang; reaching here is the assertion.
     expect(true).toBe(true)
   })
 })

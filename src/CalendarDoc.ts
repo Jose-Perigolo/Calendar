@@ -3,7 +3,7 @@
 const docs = {
   messages: {
     msgAddEvent: {
-      desc: 'Add a calendar event by key (fails if key exists unless existing:true).',
+      desc: 'Add a calendar event by key (fails if key exists unless existing:true; key must match [A-Za-z0-9._:-]+).',
     },
 
     msgGetEvent: {
@@ -15,7 +15,7 @@ const docs = {
     },
 
     msgUpdateEvent: {
-      desc: 'Update fields on an existing calendar event.',
+      desc: 'Update fields on an existing calendar event (validates before assign).',
     },
 
     msgRemoveEvent: {
@@ -27,7 +27,7 @@ const docs = {
     },
 
     msgAckEvent: {
-      desc: 'Acknowledge an event; recurring events roll due forward and reset notify stages.',
+      desc: 'Acknowledge an event (default status acknowledged; done:true for done). Recurring events roll due and reset notify stages.',
     },
 
     msgSnoozeEvent: {
@@ -35,7 +35,23 @@ const docs = {
     },
 
     msgNotifyDue: {
-      desc: 'Emit newly-crossed reminder stages via hook:notify and/or notifyCallback.',
+      desc: 'Emit newly-crossed reminder stages via hook:notify and/or notifyCallback. Stages marked only on successful delivery. digest:true groups into one payload.',
+    },
+
+    msgExportIcs: {
+      desc: 'Export events as a VCALENDAR/ICS string (optional q filter).',
+    },
+
+    msgListNotifications: {
+      desc: 'List notification outbox records (when record:true).',
+    },
+
+    msgRefreshEvent: {
+      desc: 'Refresh one event due date via app-registered sys:calendar,hook:source.',
+    },
+
+    msgRefreshEvents: {
+      desc: 'Refresh many events via hook:source (optional q filter).',
     },
   },
 }

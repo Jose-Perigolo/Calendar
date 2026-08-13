@@ -1,10 +1,15 @@
 "use strict";
 /* Copyright © 2024–2026 Seneca Project Contributors, MIT License. */
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.KEY_RE = void 0;
 exports.nextDue = nextDue;
 exports.crossedStages = crossedStages;
+exports.buildIcs = buildIcs;
 const MS_DAY = 24 * 60 * 60 * 1000;
 const MS_WEEK = 7 * MS_DAY;
+/** Cosmos-safe / portable entity ids (no / \\ # ?). */
+const KEY_RE = /^[A-Za-z0-9._:-]+$/;
+exports.KEY_RE = KEY_RE;
 const VALID_RECURRENCE = [
     'none',
     'daily',
@@ -57,7 +62,6 @@ function crossedStages(due, remindBefore, now) {
             out.push(stage);
         }
     }
-    // Also treat "at/after due" as stage 0 when due itself is reached
     if (now >= due && out.indexOf(0) < 0) {
         out.push(0);
     }
@@ -93,14 +97,13 @@ function stagesNotYetNotified(crossed, notifiedStages) {
     return fresh;
 }
 function isDueWindow(entry, now) {
-    // Only active events; snoozed count once snoozeUntil has passed.
     if ('active' === entry.status) {
         // ok
     }
     else if ('snoozed' === entry.status &&
         null != entry.snoozeUntil &&
         now >= entry.snoozeUntil) {
-        // woken by clock — treat as due-eligible
+        // woken by clock
     }
     else {
         return false;
@@ -121,10 +124,91 @@ function canonString(canon) {
 function plainEvent(entry) {
     return null == entry ? undefined : entry.data$(false);
 }
+/** Delivery succeeds when there is no explicit failure ({ok:false}) and no throw. */
+function isDeliveryOk(result) {
+    if (null == result)
+        return true;
+    if ('object' === typeof result && false === result.ok)
+        return false;
+    return true;
+}
+function pad2(n) {
+    return n < 10 ? '0' + n : String(n);
+}
+/** Format UTC ms as ICS basic datetime (YYYYMMDDTHHMMSSZ). */
+function icsDate(ms) {
+    const d = new Date(ms);
+    return (d.getUTCFullYear() +
+        pad2(d.getUTCMonth() + 1) +
+        pad2(d.getUTCDate()) +
+        'T' +
+        pad2(d.getUTCHours()) +
+        pad2(d.getUTCMinutes()) +
+        pad2(d.getUTCSeconds()) +
+        'Z');
+}
+function icsEscape(text) {
+    return String(text)
+        .replace(/\\/g, '\\\\')
+        .replace(/\n/g, '\\n')
+        .replace(/;/g, '\\;')
+        .replace(/,/g, '\\,');
+}
+function rruleFor(recurrence) {
+    switch (recurrence) {
+        case 'daily':
+            return 'FREQ=DAILY';
+        case 'weekly':
+            return 'FREQ=WEEKLY';
+        case 'monthly':
+            return 'FREQ=MONTHLY';
+        case 'yearly':
+            return 'FREQ=YEARLY';
+        default:
+            return null;
+    }
+}
+function buildIcs(events) {
+    const lines = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//seneca//calendar//EN',
+        'CALSCALE:GREGORIAN',
+        'METHOD:PUBLISH',
+    ];
+    const stamp = icsDate(Date.now());
+    for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        const cats = [];
+        if (ev.severity)
+            cats.push(String(ev.severity));
+        if (ev.kind)
+            cats.push(String(ev.kind));
+        lines.push('BEGIN:VEVENT');
+        lines.push('UID:' + icsEscape(String(ev.key)));
+        lines.push('DTSTAMP:' + stamp);
+        lines.push('DTSTART:' + icsDate(Number(ev.due)));
+        lines.push('SUMMARY:' + icsEscape(null != ev.title ? ev.title : ev.key));
+        if (ev.description) {
+            lines.push('DESCRIPTION:' + icsEscape(ev.description));
+        }
+        if (cats.length) {
+            lines.push('CATEGORIES:' + cats.map(icsEscape).join(','));
+        }
+        const rrule = rruleFor(ev.recurrence);
+        if (rrule) {
+            lines.push('RRULE:' + rrule);
+        }
+        lines.push('END:VEVENT');
+    }
+    lines.push('END:VCALENDAR');
+    return lines.join('\r\n') + '\r\n';
+}
 function Calendar(options) {
     const seneca = this;
     const { Default } = seneca.valid;
     const canon = canonString(options.canon);
+    const recordCanon = canonString(options.recordCanon);
     const getNow = typeof options.now === 'function' ? options.now : () => Date.now();
     let tickTimer = null;
     seneca
@@ -141,10 +225,13 @@ function Calendar(options) {
         .message('due:events', {}, msgDueEvents)
         .message('ack:event', { key: String }, msgAckEvent)
         .message('snooze:event', { key: String, until: Number }, msgSnoozeEvent)
-        .message('notify:due', {}, msgNotifyDue);
-    // Note: do not register a default sys:calendar,hook:notify action.
-    // Plugin init would re-pin it above handlers added between use() and ready().
-    // Apps register the hook themselves; notify:due calls it when present.
+        .message('notify:due', {}, msgNotifyDue)
+        .message('export:ics', { q: Default({}) }, msgExportIcs)
+        .message('list:notifications', { q: Default({}) }, msgListNotifications)
+        .message('refresh:event', { key: String }, msgRefreshEvent)
+        .message('refresh:events', { q: Default({}) }, msgRefreshEvents);
+    // Note: do not register default hook:notify / hook:source actions.
+    // Plugin init would re-pin them above handlers added between use() and ready().
     seneca.add('init:Calendar', function (_msg, reply) {
         if (options.tick && options.tick.active) {
             const interval = options.tick.interval > 0 ? options.tick.interval : 60 * 1000;
@@ -169,10 +256,65 @@ function Calendar(options) {
         }
         this.prior(msg, reply);
     });
+    async function deliverPayload(payload) {
+        const seneca = this;
+        let lastResult = undefined;
+        try {
+            if (typeof options.notifyCallback === 'function') {
+                lastResult = await options.notifyCallback.call(seneca, payload);
+                if (!isDeliveryOk(lastResult)) {
+                    return { ok: false, result: lastResult };
+                }
+            }
+            if (seneca.find('sys:calendar,hook:notify')) {
+                lastResult = await seneca.post('sys:calendar,hook:notify', payload);
+                if (!isDeliveryOk(lastResult)) {
+                    return { ok: false, result: lastResult };
+                }
+            }
+            return { ok: true, result: lastResult };
+        }
+        catch (err) {
+            return { ok: false, result: lastResult, error: err };
+        }
+    }
+    async function recordNotification(data) {
+        if (!options.record)
+            return;
+        const seneca = this;
+        const row = {
+            event_key: data.event_key,
+            stage: data.stage,
+            when: data.when,
+            severity: data.severity,
+            delivered: data.delivered,
+            result: null == data.result
+                ? null
+                : 'object' === typeof data.result
+                    ? Object.assign({}, data.result)
+                    : { value: data.result },
+            meta: data.meta && 'object' === typeof data.meta ? Object.assign({}, data.meta) : {},
+        };
+        await seneca.entity(recordCanon).data$(row).save$();
+    }
+    async function markNotified(entry, fresh, now) {
+        const notifiedStages = Array.isArray(entry.notifiedStages)
+            ? entry.notifiedStages.slice()
+            : [];
+        entry.notifiedStages = notifiedStages.concat(fresh);
+        entry.lastNotified = now;
+        return entry.save$();
+    }
     async function msgAddEvent(msg) {
         const seneca = this;
         const key = msg.key;
         const existing = true === msg.existing;
+        if (!KEY_RE.test(key)) {
+            return {
+                ok: false,
+                why: 'invalid-key',
+            };
+        }
         let entry = await seneca.entity(canon).load$(key);
         if (null != entry) {
             if (existing) {
@@ -252,6 +394,16 @@ function Calendar(options) {
                 why: 'key-not-found',
             };
         }
+        // Validate before mutating so a rejected update never partially assigns.
+        if (undefined !== msg.recurrence && VALID_RECURRENCE.indexOf(msg.recurrence) < 0) {
+            return { ok: false, why: 'invalid-recurrence' };
+        }
+        if (undefined !== msg.severity && VALID_SEVERITY.indexOf(msg.severity) < 0) {
+            return { ok: false, why: 'invalid-severity' };
+        }
+        if (undefined !== msg.status && VALID_STATUS.indexOf(msg.status) < 0) {
+            return { ok: false, why: 'invalid-status' };
+        }
         const fields = [
             'kind',
             'title',
@@ -266,6 +418,7 @@ function Calendar(options) {
             'intervalMs',
             'lastNotified',
             'notifiedStages',
+            'recurrence',
         ];
         for (let i = 0; i < fields.length; i++) {
             const f = fields[i];
@@ -275,18 +428,6 @@ function Calendar(options) {
         }
         if (undefined !== msg.remindBefore) {
             entry.remindBefore = uniqueSortedDesc(Array.isArray(msg.remindBefore) ? msg.remindBefore : []);
-        }
-        if (undefined !== msg.recurrence) {
-            if (VALID_RECURRENCE.indexOf(msg.recurrence) < 0) {
-                return { ok: false, why: 'invalid-recurrence' };
-            }
-            entry.recurrence = msg.recurrence;
-        }
-        if (undefined !== msg.severity && VALID_SEVERITY.indexOf(msg.severity) < 0) {
-            return { ok: false, why: 'invalid-severity' };
-        }
-        if (undefined !== msg.status && VALID_STATUS.indexOf(msg.status) < 0) {
-            return { ok: false, why: 'invalid-status' };
         }
         entry = await entry.save$();
         return {
@@ -335,7 +476,6 @@ function Calendar(options) {
             };
         }
         const recurrence = entry.recurrence || 'none';
-        // Reset notify stage tracking for the next cycle
         entry.notifiedStages = [];
         entry.lastNotified = null;
         entry.snoozeUntil = null;
@@ -344,10 +484,8 @@ function Calendar(options) {
             entry.status = 'active';
         }
         else {
-            entry.status = true === msg.done || undefined === msg.done ? 'done' : 'acknowledged';
-            if ('acknowledged' === entry.status) {
-                // still acknowledged once; no recurrence
-            }
+            // Plain ack → acknowledged; require done:true to mark done.
+            entry.status = true === msg.done ? 'done' : 'acknowledged';
         }
         entry = await entry.save$();
         return {
@@ -376,7 +514,6 @@ function Calendar(options) {
         }
         entry.status = 'snoozed';
         entry.snoozeUntil = until;
-        // Reset stages so the next threshold after wake notifies cleanly
         entry.notifiedStages = [];
         entry.lastNotified = null;
         entry = await entry.save$();
@@ -386,15 +523,15 @@ function Calendar(options) {
             event: plainEvent(entry),
         };
     }
-    async function msgNotifyDue(msg) {
+    async function collectPending(now) {
         const seneca = this;
-        const now = null != msg.now ? Number(msg.now) : getNow();
         let list = await seneca.entity(canon).list$({});
-        const emissions = [];
+        const pending = [];
         for (let i = 0; i < list.length; i++) {
             let entry = list[i];
-            // Wake snoozed events whose snooze has expired
-            if ('snoozed' === entry.status && null != entry.snoozeUntil && now >= entry.snoozeUntil) {
+            if ('snoozed' === entry.status &&
+                null != entry.snoozeUntil &&
+                now >= entry.snoozeUntil) {
                 entry.status = 'active';
                 entry.snoozeUntil = null;
             }
@@ -412,31 +549,201 @@ function Calendar(options) {
             if (0 === fresh.length) {
                 continue;
             }
+            pending.push({
+                entry,
+                fresh,
+                payload: {
+                    event: entry.data$(false),
+                    stages: fresh,
+                    now,
+                },
+            });
+        }
+        return pending;
+    }
+    async function writeOutboxFor(item, now, delivered, result, error, meta) {
+        const seneca = this;
+        const severity = item.entry.severity || 'info';
+        for (let s = 0; s < item.fresh.length; s++) {
+            await recordNotification.call(seneca, {
+                event_key: item.entry.key,
+                stage: item.fresh[s],
+                when: now,
+                severity,
+                delivered,
+                result,
+                meta: Object.assign({}, meta || {}, error ? { error: error && error.message ? String(error.message) : String(error) } : {}),
+            });
+        }
+    }
+    async function msgNotifyDue(msg) {
+        const seneca = this;
+        const now = null != msg.now ? Number(msg.now) : getNow();
+        const digest = true === msg.digest;
+        const pending = await collectPending.call(seneca, now);
+        const emissions = [];
+        const failures = [];
+        if (0 === pending.length) {
+            return { ok: true, now, notified: [], failed: [] };
+        }
+        if (digest) {
             const payload = {
-                event: entry.data$(false),
-                stages: fresh,
+                digest: true,
+                events: pending.map((p) => p.payload),
                 now,
             };
-            // Pluggable delivery: option callback and/or registered hook
-            if (typeof options.notifyCallback === 'function') {
-                await options.notifyCallback.call(seneca, payload);
+            const delivery = await deliverPayload.call(seneca, payload);
+            for (let i = 0; i < pending.length; i++) {
+                const item = pending[i];
+                await writeOutboxFor.call(seneca, item, now, delivery.ok, delivery.result, delivery.error, { digest: true });
+                if (delivery.ok) {
+                    item.entry = await markNotified.call(seneca, item.entry, item.fresh, now);
+                    emissions.push({
+                        key: item.entry.key,
+                        stages: item.fresh,
+                        event: plainEvent(item.entry),
+                    });
+                }
+                else {
+                    failures.push({
+                        key: item.entry.key,
+                        stages: item.fresh,
+                        why: 'delivery-failed',
+                    });
+                }
             }
-            if (seneca.find('sys:calendar,hook:notify')) {
-                await seneca.post('sys:calendar,hook:notify', payload);
+            return {
+                ok: true,
+                now,
+                digest: true,
+                notified: emissions,
+                failed: failures,
+            };
+        }
+        // Per-event delivery: one failure must not abort the batch.
+        for (let i = 0; i < pending.length; i++) {
+            const item = pending[i];
+            const delivery = await deliverPayload.call(seneca, item.payload);
+            await writeOutboxFor.call(seneca, item, now, delivery.ok, delivery.result, delivery.error);
+            if (!delivery.ok) {
+                failures.push({
+                    key: item.entry.key,
+                    stages: item.fresh,
+                    why: 'delivery-failed',
+                });
+                if (options.debug && delivery.error) {
+                    seneca.log.debug('calendar-notify-error', item.entry.key, delivery.error);
+                }
+                continue;
             }
-            entry.notifiedStages = notifiedStages.concat(fresh);
-            entry.lastNotified = now;
-            entry = await entry.save$();
+            item.entry = await markNotified.call(seneca, item.entry, item.fresh, now);
             emissions.push({
-                key: entry.key,
-                stages: fresh,
-                event: plainEvent(entry),
+                key: item.entry.key,
+                stages: item.fresh,
+                event: plainEvent(item.entry),
             });
         }
         return {
             ok: true,
             now,
             notified: emissions,
+            failed: failures,
+        };
+    }
+    async function msgExportIcs(msg) {
+        const seneca = this;
+        const q = msg.q || {};
+        let list = await seneca.entity(canon).list$(q);
+        list = list.map((entry) => entry.data$(false));
+        const ics = buildIcs(list);
+        return {
+            ok: true,
+            ics,
+            count: list.length,
+        };
+    }
+    async function msgListNotifications(msg) {
+        const seneca = this;
+        const q = msg.q || {};
+        let list = await seneca.entity(recordCanon).list$(q);
+        list = list.map((entry) => entry.data$(false));
+        return {
+            ok: true,
+            list,
+        };
+    }
+    async function applySourceRefresh(entry, now) {
+        const seneca = this;
+        if (!seneca.find('sys:calendar,hook:source')) {
+            return {
+                ok: true,
+                changed: false,
+                event: plainEvent(entry),
+                why: 'no-source-hook',
+            };
+        }
+        const src = await seneca.post('sys:calendar,hook:source', {
+            key: entry.key,
+            kind: entry.kind,
+            event: plainEvent(entry),
+            now,
+        });
+        if (!isDeliveryOk(src) || null == src || null == src.due) {
+            return {
+                ok: true,
+                changed: false,
+                event: plainEvent(entry),
+                why: 'no-due',
+                source: src,
+            };
+        }
+        const newDue = Number(src.due);
+        if (!isFinite(newDue) || newDue === entry.due) {
+            return {
+                ok: true,
+                changed: false,
+                event: plainEvent(entry),
+                source: src,
+            };
+        }
+        entry.due = newDue;
+        // New due date → reset stage tracking for the new cycle
+        entry.notifiedStages = [];
+        entry.lastNotified = null;
+        entry = await entry.save$();
+        return {
+            ok: true,
+            changed: true,
+            event: plainEvent(entry),
+            source: src,
+        };
+    }
+    async function msgRefreshEvent(msg) {
+        const seneca = this;
+        const key = msg.key;
+        const now = null != msg.now ? Number(msg.now) : getNow();
+        let entry = await seneca.entity(canon).load$(key);
+        if (null == entry) {
+            return {
+                ok: false,
+                why: 'key-not-found',
+            };
+        }
+        return applySourceRefresh.call(seneca, entry, now);
+    }
+    async function msgRefreshEvents(msg) {
+        const seneca = this;
+        const now = null != msg.now ? Number(msg.now) : getNow();
+        const q = msg.q || {};
+        let list = await seneca.entity(canon).list$(q);
+        const results = [];
+        for (let i = 0; i < list.length; i++) {
+            results.push(await applySourceRefresh.call(seneca, list[i], now));
+        }
+        return {
+            ok: true,
+            now,
+            list: results,
         };
     }
 }
@@ -449,20 +756,25 @@ const defaults = {
         name: 'calendar',
     },
     now: () => Date.now(),
-    // empty = only the due instant (stage 0) counts unless caller sets remindBefore
     remindBefore: [],
     tick: {
         active: false,
         interval: 60 * 1000,
     },
-    // no-op; override to deliver (null breaks Seneca/gubu option shape walk)
     notifyCallback: function (_data) { },
+    record: false,
+    recordCanon: {
+        zone: undefined,
+        base: 'sys',
+        name: 'calendar_notification',
+    },
 };
 Object.assign(Calendar, { defaults });
-// Prevent name mangling (init:Calendar, close cleanup)
 Object.defineProperty(Calendar, 'name', { value: 'Calendar' });
 Calendar.nextDue = nextDue;
 Calendar.crossedStages = crossedStages;
+Calendar.KEY_RE = KEY_RE;
+Calendar.buildIcs = buildIcs;
 exports.default = Calendar;
 if ('undefined' !== typeof module) {
     module.exports = Calendar;

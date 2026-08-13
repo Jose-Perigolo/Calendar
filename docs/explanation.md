@@ -27,3 +27,16 @@ Email, Slack, UI toasts, and queues are application concerns. The plugin only em
 ## Optional tick
 
 A built-in interval is convenient for single-process apps and dangerous if left running in tests. It is off by default and always cleared on `seneca.close`.
+
+## Delivery success and the outbox
+
+Marking a stage notified before the channel accepts it causes silent loss on
+failure. `notify:due` therefore updates `notifiedStages` only after the
+callback/hook succeeds. Optional `record:true` rows give you an outbox and an
+audit trail (`delivered: true|false`) without coupling the plugin to a mailer.
+
+## Concurrency
+
+Stage accounting is optimistic read-modify-write. Two notifier instances can
+both observe an unmarked stage and both deliver. Keep a single scheduler (or
+external lease) in front of `notify:due`.

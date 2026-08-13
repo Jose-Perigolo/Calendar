@@ -87,19 +87,32 @@ Review the [unit tests](test/Calendar.test.ts) and [tutorial](docs/tutorial.md).
 * `remindBefore` : number[] — default remind offsets in ms (default `[]`)
 * `tick` : `{ active: boolean, interval: number }` — optional poller, off by default; cleared on close
 * `notifyCallback` : function — optional delivery callback (default no-op)
+* `record` : boolean — write notification outbox rows (default `false`)
+* `recordCanon` : object — outbox canon (default `{ base: 'sys', name: 'calendar_notification' }`)
 
 ## Action Patterns
 
-* `sys:calendar,add:event` — create (rejects duplicate `key`; `existing:true` for idempotent seed)
+* `sys:calendar,add:event` — create (key `^[A-Za-z0-9._:-]+$`; rejects duplicates; `existing:true` to seed)
 * `sys:calendar,get:event` — load by key
 * `sys:calendar,list:event` — list by query
-* `sys:calendar,update:event` — update fields
+* `sys:calendar,update:event` — update fields (validates before assign)
 * `sys:calendar,remove:event` — remove by key
 * `sys:calendar,due:events` — active events inside remind window
-* `sys:calendar,ack:event` — acknowledge / roll recurrence; resets notify stages
+* `sys:calendar,ack:event` — acknowledge (default `acknowledged`; `done:true` for done) / roll recurrence
 * `sys:calendar,snooze:event` — snooze until timestamp; resets notify stages
-* `sys:calendar,notify:due` — emit newly crossed stages via hook/callback
-* `sys:calendar,hook:notify` — app-registered delivery hook (optional; not shipped as a default action)
+* `sys:calendar,notify:due` — emit newly crossed stages; mark only on successful delivery; `digest:true` groups
+* `sys:calendar,export:ics` — VCALENDAR string (optional `q`)
+* `sys:calendar,list:notifications` — outbox query (when `record:true`)
+* `sys:calendar,refresh:event` / `refresh:events` — recompute `due` via `hook:source`
+* `sys:calendar,hook:notify` — app-registered delivery hook
+* `sys:calendar,hook:source` — app-registered due refresh hook
+
+## Changelog (punch-list)
+
+* Delivery success gating + per-event failure isolation on `notify:due`
+* Cosmos-safe key validation; outbox (`record` / `list:notifications`); ICS export
+* `ack` defaults to `acknowledged`; digest mode; `refresh:event(s)` + `hook:source`
+* Docs: single-scheduler concurrency note
 
 ## Event fields (default entity `sys/calendar`)
 
@@ -107,8 +120,11 @@ Review the [unit tests](test/Calendar.test.ts) and [tutorial](docs/tutorial.md).
 `severity`, `status`, `snoozeUntil`, `lastNotified`, `notifiedStages`,
 `assignee`, `tags`, `meta` (plus `intervalMs` when `recurrence` is `interval-ms`).
 
-`notifiedStages` records which remind thresholds already fired so `notify:due`
-does not spam on every poll. `ack` / `snooze` clear it for the next cycle.
+`notifiedStages` records which remind thresholds were **successfully delivered**
+so `notify:due` does not spam on every poll. Failed deliveries leave stages
+unmarked for retry. `ack` / `snooze` clear the list for the next cycle.
+
+Drive `notify:due` from a **single scheduler** — there is no distributed lock.
 
 ## Motivation
 

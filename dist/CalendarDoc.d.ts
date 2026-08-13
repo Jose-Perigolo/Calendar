@@ -27,6 +27,18 @@ declare const docs: {
         msgNotifyDue: {
             desc: string;
         };
+        msgExportIcs: {
+            desc: string;
+        };
+        msgListNotifications: {
+            desc: string;
+        };
+        msgRefreshEvent: {
+            desc: string;
+        };
+        msgRefreshEvents: {
+            desc: string;
+        };
     };
 };
 export default docs;
