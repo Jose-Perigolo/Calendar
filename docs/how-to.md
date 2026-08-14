@@ -60,10 +60,12 @@ scale-out of the notifier is not supported without an external lease.
 
 ## Reliable delivery via the outbox
 
-Enable `record: true` to persist an attempt row per stage (default canon
-`sys/calendar_notification`). Failed deliveries write `delivered:false` and leave
-the stage unmarked so the next poll retries. A channel worker can drain
-`list:notifications` with `{ delivered: false }`:
+Enable `record: true` to persist an attempt row per `(event_key, stage)` (default
+canon `sys/calendar_notification`). Failed deliveries write/upsert
+`delivered:false` (incrementing `attempts` / `lastTried`) and leave the stage
+unmarked so the next poll retries — without appending a new row each tick.
+
+A channel worker can drain `list:notifications` with `{ delivered: false }`:
 
 ```js
 .use(Calendar, { record: true })
@@ -73,6 +75,7 @@ const outbox = await seneca.post('sys:calendar,list:notifications', {
 })
 ```
 
+Prune or archive delivered rows yourself (the plugin does not retain a TTL).
 ## Subscribe to the ICS feed
 
 ```js

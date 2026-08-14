@@ -252,26 +252,89 @@ describe('Calendar', () => {
     expect(b.event.notifiedStages).toEqual([])
     expect(c.event.notifiedStages).toEqual([0])
 
-    const notes = await seneca.post('sys:calendar,list:notifications')
+    let notes = await seneca.post('sys:calendar,list:notifications')
     expect(notes.list.length).toBe(3)
     const byKey: any = {}
     for (const n of notes.list) byKey[n.event_key] = n
     expect(byKey['ev-a'].delivered).toBe(false)
+    expect(byKey['ev-a'].attempts).toBe(1)
     expect(byKey['ev-b'].delivered).toBe(false)
     expect(byKey['ev-c'].delivered).toBe(true)
+
+    // Re-poll while still failing: upsert same rows (no unbounded growth)
+    await seneca.post('sys:calendar,notify:due')
+    notes = await seneca.post('sys:calendar,list:notifications')
+    expect(notes.list.length).toBe(3)
+    for (const n of notes.list) byKey[n.event_key] = n
+    expect(byKey['ev-a'].attempts).toBe(2)
+    expect(byKey['ev-b'].attempts).toBe(2)
+    expect(byKey['ev-c'].attempts).toBe(1) // success not retried
 
     // Retry after fixing A — stage should fire once and stick
     failA = false
     const retry = await seneca.post('sys:calendar,notify:due')
     expect(retry.notified.map((n: any) => n.key).sort()).toEqual(['ev-a'])
-    // ev-b still returns ok:false
     expect(retry.failed.map((f: any) => f.key)).toContain('ev-b')
 
     const a2 = await seneca.post('sys:calendar,get:event,key:ev-a')
     expect(a2.event.notifiedStages).toEqual([0])
 
+    notes = await seneca.post('sys:calendar,list:notifications')
+    expect(notes.list.length).toBe(3)
+    for (const n of notes.list) byKey[n.event_key] = n
+    expect(byKey['ev-a'].delivered).toBe(true)
+    expect(byKey['ev-a'].attempts).toBe(3)
+
     const retry2 = await seneca.post('sys:calendar,notify:due')
     expect(retry2.notified.find((n: any) => n.key === 'ev-a')).toBeUndefined()
+  })
+
+
+  test('notify-digest-failure-leaves-stages-unmarked', async () => {
+    const due = Date.UTC(2026, 7, 2)
+    const now = due
+    let fail = true
+
+    const seneca = makeSeneca({ now: () => now, record: true })
+    seneca.message('sys:calendar,hook:notify', async function () {
+      if (fail) return { ok: false, why: 'digest-down' }
+      return { ok: true }
+    })
+
+    await seneca.post('sys:calendar,add:event', {
+      key: 'dg-a',
+      due,
+      remindBefore: [],
+    })
+    await seneca.post('sys:calendar,add:event', {
+      key: 'dg-b',
+      due,
+      remindBefore: [],
+    })
+
+    const bad = await seneca.post('sys:calendar,notify:due', { digest: true })
+    expect(bad.notified).toHaveLength(0)
+    expect(bad.failed.map((f: any) => f.key).sort()).toEqual(['dg-a', 'dg-b'])
+
+    const a0 = await seneca.post('sys:calendar,get:event,key:dg-a')
+    expect(a0.event.notifiedStages).toEqual([])
+
+    let notes = await seneca.post('sys:calendar,list:notifications')
+    expect(notes.list.length).toBe(2)
+    expect(notes.list.every((n: any) => n.delivered === false)).toBe(true)
+
+    // Second failed digest upserts, does not duplicate
+    await seneca.post('sys:calendar,notify:due', { digest: true })
+    notes = await seneca.post('sys:calendar,list:notifications')
+    expect(notes.list.length).toBe(2)
+    expect(notes.list.every((n: any) => n.attempts === 2)).toBe(true)
+
+    fail = false
+    const ok = await seneca.post('sys:calendar,notify:due', { digest: true })
+    expect(ok.notified.map((n: any) => n.key).sort()).toEqual(['dg-a', 'dg-b'])
+    notes = await seneca.post('sys:calendar,list:notifications')
+    expect(notes.list.length).toBe(2)
+    expect(notes.list.every((n: any) => n.delivered === true)).toBe(true)
   })
 
 

@@ -39,15 +39,27 @@ Validated against plugin `defaults` at registration (Seneca/gubu).
 
 ## Entity: `sys/calendar_notification` (outbox, when `record:true`)
 
+One row per `(event_key, stage)` — id is `event_key:stage`. Repeated
+`notify:due` attempts **upsert** the same row (`attempts++`, `lastTried`) instead
+of appending, so failed polls do not grow the table unbounded.
+
 | Field | Type | Notes |
 | ----- | ---- | ----- |
 | `event_key` | string | Calendar event key. |
 | `stage` | number | Remind stage (ms offset, or `0` for due). |
-| `when` | number | Attempt timestamp. |
+| `when` | number | First attempt timestamp. |
+| `lastTried` | number | Most recent attempt timestamp. |
+| `attempts` | number | Delivery attempts for this stage. |
 | `severity` | string | Copied from event. |
 | `delivered` | boolean | `true` only when hook/callback succeeded. |
+| `deliveredAt` | number \| null | Set when `delivered` becomes true. |
 | `result` | object \| null | Hook/callback return value (best-effort). |
 | `meta` | object | Extra (e.g. `digest`, error message). |
+
+**Retention:** the plugin does not prune outbox rows. Schedule your own cleanup
+(e.g. delete `delivered:true` older than N days, or archive stuck
+`delivered:false` after investigation). `list:notifications` with a store-specific
+query is the drain/prune entry point.
 
 ## Concurrency
 

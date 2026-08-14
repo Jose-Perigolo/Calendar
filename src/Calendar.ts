@@ -419,21 +419,52 @@ function Calendar(this: any, options: CalendarOptionsFull) {
   ) {
     if (!options.record) return
     const seneca = this
-    const row: any = {
-      event_key: data.event_key,
-      stage: data.stage,
-      when: data.when,
-      severity: data.severity,
-      delivered: data.delivered,
-      result:
-        null == data.result
-          ? null
-          : 'object' === typeof data.result
-            ? Object.assign({}, data.result)
-            : { value: data.result },
-      meta: data.meta && 'object' === typeof data.meta ? Object.assign({}, data.meta) : {},
+
+    // Stable outbox id: one row per (event_key, stage). Re-polls upsert instead of appending.
+    const id = data.event_key + ':' + String(data.stage)
+    const result =
+      null == data.result
+        ? null
+        : 'object' === typeof data.result
+          ? Object.assign({}, data.result)
+          : { value: data.result }
+    const meta =
+      data.meta && 'object' === typeof data.meta ? Object.assign({}, data.meta) : {}
+
+    let entry = await seneca.entity(recordCanon).load$(id)
+
+    if (null != entry) {
+      const prevAttempts =
+        'number' === typeof entry.attempts && entry.attempts > 0 ? entry.attempts : 1
+      entry.attempts = prevAttempts + 1
+      entry.lastTried = data.when
+      entry.delivered = data.delivered
+      entry.severity = data.severity
+      entry.result = result
+      entry.meta = Object.assign({}, entry.meta || {}, meta)
+      if (data.delivered) {
+        entry.deliveredAt = data.when
+      }
+      await entry.save$()
+      return
     }
-    await seneca.entity(recordCanon).data$(row).save$()
+
+    await seneca
+      .entity(recordCanon)
+      .data$({
+        id$: id,
+        event_key: data.event_key,
+        stage: data.stage,
+        when: data.when,
+        lastTried: data.when,
+        attempts: 1,
+        severity: data.severity,
+        delivered: data.delivered,
+        deliveredAt: data.delivered ? data.when : null,
+        result,
+        meta,
+      })
+      .save$()
   }
 
 

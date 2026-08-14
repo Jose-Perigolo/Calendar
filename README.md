@@ -111,8 +111,9 @@ Review the [unit tests](test/Calendar.test.ts) and [tutorial](docs/tutorial.md).
 
 * Delivery success gating + per-event failure isolation on `notify:due`
 * Cosmos-safe key validation; outbox (`record` / `list:notifications`); ICS export
+* Outbox upserts by `(event_key, stage)` (`attempts` / `lastTried`) — no unbounded failure growth
 * `ack` defaults to `acknowledged`; digest mode; `refresh:event(s)` + `hook:source`
-* Docs: single-scheduler concurrency note
+* Docs: single-scheduler concurrency note + outbox retention
 
 ## Event fields (default entity `sys/calendar`)
 
