@@ -25,6 +25,7 @@
     "test-watch": "jest --coverage --watchAll",
     "watch": "tsc -w -d",
     "build": "tsc -d",
+    "prepare": "npm run build",
     "doc": "seneca-doc",
     "clean": "rm -rf node_modules yarn.lock package-lock.json",
     "reset": "npm run clean && npm i && npm test",
@@ -56,8 +57,8 @@
     "typescript": "^5.4.5"
   },
   "peerDependencies": {
-    "seneca": "^3.38.0",
-    "seneca-entity": "^28.1.0",
-    "seneca-promisify": "^3.7.2"
+    "seneca": ">=3.33.0",
+    "seneca-entity": ">=25",
+    "seneca-promisify": ">=3.7.1"
   }
 }

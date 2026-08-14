@@ -18,7 +18,8 @@ the plugin does not hardcode email or UI.
 $ npm install @seneca/calendar
 ```
 
-Requires Node `>=16`, Seneca `>=3`, and `seneca-entity` `>=25`.
+Requires Node `>=16`, Seneca `>=3.33`, `seneca-entity` `>=25`, and `seneca-promisify` `>=3.7.1`.
+`dist/` is committed; `prepare` runs `npm run build` for git installs.
 
 ## Documentation
 
